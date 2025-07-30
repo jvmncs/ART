@@ -34,14 +34,17 @@ class ModalBackend(Backend):
     async def initialize_cluster(
         cls,
         app_name: str = "art-backend",
+        # FEEDBACK: default should be H100
         gpu_type: str = "A10G",
         gpu_count: int = 1,
         memory: int = 32000,
         timeout: int = 3600,
+        # FEEDBACK: should be named "min_containers", this parameter was renamed awhile ago in the Modal client. make sure to propagate this fix to app.function
         keep_warm: int = 0,
         volume_name: str = "art-volume",
         image_packages: list[str] | None = None,
         environment: str = "main",
+        # FEEDBACK: more flexible env passing seems good. not everyone wants to use a .env. will need to think this through carefully, so it doesn't bloat the signature.
         env_file: str | None = None,
         force_rebuild: bool = False,
     ) -> "ModalBackend":
