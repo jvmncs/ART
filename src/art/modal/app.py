@@ -1,265 +1,142 @@
-import json
-from typing import AsyncIterator
+"""
+Modal app for ART backend with proper Modal API usage.
+
+This module creates a Modal app that can be deployed with different:
+- GPU types and counts (H100:2, A100:4, etc.)
+- Volume configurations
+- App names
+- Environment variables
+- Image configurations with ART backend dependencies
+"""
+
+import pathlib
+import os
+import sys
+from typing import Dict
+
 import modal
-from fastapi import FastAPI, Body, Request
-from fastapi.responses import StreamingResponse, JSONResponse
 
-from .. import dev
-from ..local import LocalBackend
-from ..model import Model, TrainableModel
-from ..trajectories import TrajectoryGroup
-from ..types import TrainConfig
-from ..utils.deploy_model import LoRADeploymentProvider
-from ..errors import ARTError
+from art.cli import create_local_backend_app
+from art import local
+from art.modal.util import ModalGPUConfig
 
 
-# Modal app configuration
-app = modal.App("art-backend")
+def create_modal_app(
+    app_name: str = "art-backend",
+    volume_name: str = "art-volume",
+    gpu_config: str | ModalGPUConfig | list[str | ModalGPUConfig] = "H100:1",
+    timeout: int = 3600,
+    memory: int = 32000,
+    keep_warm: int = 0,
+    env_vars: Dict[str, str] | None = None,
+    image: modal.Image | None = None,
+    image_packages: list[str] | None = None,
+    art_version: str | pathlib.Path | None = None,
+) -> modal.App:
+    """
+    Create a Modal app for ART backend.
 
-# GPU and image configuration
-gpu_config = modal.gpu.H100(count=1)
-image = (
-    modal.Image.debian_slim()
-    .pip_install(
-        [
-            "torch",
-            "transformers",
-            "unsloth",
-            "torchtune",
+    Args:
+        app_name: Name for the Modal app
+        volume_name: Name for the Modal volume (created if missing)
+        gpu_config: GPU specification (e.g., "H100:2", "A100:4", "T4:1")
+        timeout: Function timeout in seconds
+        memory: Memory allocation in MB
+        keep_warm: Number of containers to keep warm
+        env_vars: Environment variables to forward to Modal
+        image: Base Modal image to use
+        image_packages: Additional packages to install in the image
+        art_version: ART version to install (semver string or local path)
+
+    Returns:
+        Configured Modal app instance
+    """
+    # Create Modal app with configurable name
+    app = modal.App(app_name)
+
+    # Create configurable volume
+    volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+
+    gpu_configs = []
+    if not isinstance(gpu_config, list):
+        gpu_config = [gpu_config]
+
+    for cfg in gpu_config:
+        if not isinstance(cfg, ModalGPUConfig):
+            gpu_configs.append(ModalGPUConfig(cfg))
+        else:
+            gpu_configs.append(cfg)
+
+    # Validate that only one of image or image_packages is provided
+    if image is not None and image_packages is not None:
+        raise ValueError(
+            "Only one of 'image' or 'image_packages' can be provided, not both"
+        )
+
+    if image is None:
+        # Get current Python version for base image
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+        # Use debian_slim as base image with current Python version
+        image = modal.Image.debian_slim(python_version=python_version)
+
+        # Base packages for backend functionality
+        base_packages = [
             "fastapi",
             "uvicorn",
-            "httpx",
             "pydantic",
-            "tqdm",
-            "openpipe-art[backend]",
+            "httpx",
+            "aiofiles",
         ]
-    )
-    .run_commands("apt-get update && apt-get install -y curl git")
-)
 
-# FastAPI app for ART endpoints
-fastapi_app = FastAPI(title="ART Modal Backend", version="1.0.0")
+        # Extend with additional packages if provided
+        if image_packages:
+            base_packages.extend(image_packages)
 
-# Global backend instance - will be initialized on first request
-_backend_instance: LocalBackend | None = None
+        # Install base packages
+        image = image.uv_pip_install(base_packages)
 
+        # Handle ART version installation
+        if art_version is not None:
+            if isinstance(art_version, pathlib.Path) or (
+                isinstance(art_version, str) and os.path.exists(art_version)
+            ):
+                # Install from local path
+                image = image.uv_pip_install(f"{art_version}[backend]")
+            else:
+                # Install from PyPI with specific version
+                image = image.uv_pip_install(f"openpipe-art[backend]=={art_version}")
+        else:
+            # Install latest from PyPI
+            image = image.uv_pip_install("openpipe-art[backend]")
 
-def get_backend() -> LocalBackend:
-    """Get or create the backend instance."""
-    global _backend_instance
-    if _backend_instance is None:
-        _backend_instance = LocalBackend()
-    return _backend_instance
+    # Prepare environment variables and secrets
+    modal_env = {}
+    if env_vars:
+        modal_env.update(env_vars)
 
+    # Create Modal Secret from environment variables
+    secrets = []
+    if modal_env:
+        secrets.append(modal.Secret.from_dict(modal_env))
 
-# Exception handler for ARTError
-@fastapi_app.exception_handler(ARTError)
-async def art_error_handler(request: Request, exc: ARTError):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    # Configure Modal function
+    function_config = {
+        "image": image,
+        "gpu": gpu_configs,
+        "memory": memory,
+        "timeout": timeout,
+        "volumes": {"/art/": volume},
+        "secrets": secrets,
+        "keep_warm": keep_warm,
+        "serialized": True,
+    }
 
+    @app.function(**function_config)
+    @modal.asgi_app()
+    def fastapi_app():
+        """Create and configure the FastAPI app for ART backend."""
+        backend = local.LocalBackend(path="/art/")
+        return create_local_backend_app(backend)
 
-@fastapi_app.get("/healthcheck")
-async def healthcheck():
-    """Service health monitoring."""
-    return {"status": "ok"}
-
-
-@fastapi_app.post("/close")
-async def close():
-    """Close the backend and clean up resources."""
-    backend = get_backend()
-    await backend.close()
-    return {"status": "closed"}
-
-
-@fastapi_app.post("/register")
-async def register(model: Model):
-    """Register a model with the backend for logging and/or training."""
-    backend = get_backend()
-    await backend.register(model)
-    return {"status": "registered"}
-
-
-@fastapi_app.post("/_get_step")
-async def _get_step(model: TrainableModel):
-    """Get the current training step for a model."""
-    backend = get_backend()
-    step = await backend._get_step(model)
-    return step
-
-
-@fastapi_app.post("/_delete_checkpoints")
-async def _delete_checkpoints(
-    model: TrainableModel,
-    benchmark: str = Body(...),
-    benchmark_smoothing: float = Body(...),
-):
-    """Delete model checkpoints based on benchmark criteria."""
-    backend = get_backend()
-    await backend._delete_checkpoints(model, benchmark, benchmark_smoothing)
-    return {"status": "deleted"}
-
-
-@fastapi_app.post("/_prepare_backend_for_training")
-async def _prepare_backend_for_training(
-    model: TrainableModel,
-    config: dev.OpenAIServerConfig | None = Body(None),
-):
-    """Prepare the backend for training and return connection details."""
-    backend = get_backend()
-    result = await backend._prepare_backend_for_training(model, config)
-    return result
-
-
-@fastapi_app.post("/_log")
-async def _log(
-    model: Model,
-    trajectory_groups: list[TrajectoryGroup],
-    split: str = Body("val"),
-):
-    """Log trajectory groups for a model."""
-    backend = get_backend()
-    await backend._log(model, trajectory_groups, split)
-    return {"status": "logged"}
-
-
-@fastapi_app.post("/_train_model")
-async def _train_model(
-    model: TrainableModel,
-    trajectory_groups: list[TrajectoryGroup],
-    config: TrainConfig,
-    dev_config: dev.TrainConfig,
-    verbose: bool = Body(False),
-) -> StreamingResponse:
-    """Train a model with streaming progress updates."""
-    backend = get_backend()
-
-    async def stream() -> AsyncIterator[str]:
-        async for result in backend._train_model(
-            model, trajectory_groups, config, dev_config, verbose
-        ):
-            yield json.dumps(result) + "\n"
-
-    return StreamingResponse(stream(), media_type="text/plain")
-
-
-# S3 experimental endpoints
-@fastapi_app.post("/_experimental_pull_from_s3")
-async def _experimental_pull_from_s3(
-    model: Model = Body(...),
-    s3_bucket: str | None = Body(None),
-    prefix: str | None = Body(None),
-    verbose: bool = Body(False),
-    delete: bool = Body(False),
-    only_step: int | str | None = Body(None),
-):
-    """Download model directory from S3 to local file system."""
-    backend = get_backend()
-    await backend._experimental_pull_from_s3(
-        model=model,
-        s3_bucket=s3_bucket,
-        prefix=prefix,
-        verbose=verbose,
-        delete=delete,
-        only_step=only_step,
-    )
-    return {"status": "pulled"}
-
-
-@fastapi_app.post("/_experimental_push_to_s3")
-async def _experimental_push_to_s3(
-    model: Model = Body(...),
-    s3_bucket: str | None = Body(None),
-    prefix: str | None = Body(None),
-    verbose: bool = Body(False),
-    delete: bool = Body(False),
-):
-    """Upload model directory from local file system to S3."""
-    backend = get_backend()
-    await backend._experimental_push_to_s3(
-        model=model,
-        s3_bucket=s3_bucket,
-        prefix=prefix,
-        verbose=verbose,
-        delete=delete,
-    )
-    return {"status": "pushed"}
-
-
-@fastapi_app.post("/_experimental_fork_checkpoint")
-async def _experimental_fork_checkpoint(
-    model: Model = Body(...),
-    from_model: str = Body(...),
-    from_project: str | None = Body(None),
-    from_s3_bucket: str | None = Body(None),
-    not_after_step: int | None = Body(None),
-    verbose: bool = Body(False),
-    prefix: str | None = Body(None),
-):
-    """Fork a checkpoint from another model to initialize this model."""
-    backend = get_backend()
-    await backend._experimental_fork_checkpoint(
-        model=model,
-        from_model=from_model,
-        from_project=from_project,
-        from_s3_bucket=from_s3_bucket,
-        not_after_step=not_after_step,
-        verbose=verbose,
-        prefix=prefix,
-    )
-    return {"status": "forked"}
-
-
-@fastapi_app.post("/_experimental_deploy")
-async def _experimental_deploy(
-    deploy_to: LoRADeploymentProvider = Body(...),
-    model: TrainableModel = Body(...),
-    step: int | None = Body(None),
-    s3_bucket: str | None = Body(None),
-    prefix: str | None = Body(None),
-    verbose: bool = Body(False),
-    pull_s3: bool = Body(True),
-    wait_for_completion: bool = Body(True),
-):
-    """Deploy the model's latest checkpoint to a hosted inference endpoint."""
-    backend = get_backend()
-    result = await backend._experimental_deploy(
-        deploy_to=deploy_to,
-        model=model,
-        step=step,
-        s3_bucket=s3_bucket,
-        prefix=prefix,
-        verbose=verbose,
-        pull_s3=pull_s3,
-        wait_for_completion=wait_for_completion,
-    )
-    return result
-
-
-# Deploy FastAPI app to Modal
-@app.function(
-    image=image,
-    gpu=gpu_config,
-    memory=32 * 1024,  # 32GB in MB
-    timeout=3600,  # 1 hour timeout
-    allow_concurrent_inputs=10,
-    keep_warm=1,
-)
-@modal.asgi_app()
-def art_web_app():
-    """Deploy the ART FastAPI application to Modal."""
-    return fastapi_app
-
-
-# Utility function to get the deployed app URL programmatically
-@app.function()
-def get_app_url():
-    """Get the deployed app URL programmatically."""
-    return art_web_app.web_url
-
-
-# Local development entry point
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=7999)
+    return app

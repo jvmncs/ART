@@ -1,418 +1,305 @@
-from typing import TYPE_CHECKING, AsyncIterator, Optional, Literal
+import asyncio
+import os
+from typing import TYPE_CHECKING, Dict, Any
 
+import modal
+import httpx
+from dotenv import dotenv_values
+
+from .app import create_modal_app
 from ..backend import Backend
-from .. import dev
-from ..trajectories import TrajectoryGroup
-from ..types import TrainConfig
-from ..utils.deploy_model import LoRADeploymentJob, LoRADeploymentProvider
-from .utils import (
-    ModalDeploymentConfig,
-    ModalResourceConfig,
-    ModalError,
-    create_modal_image,
-    get_gpu_config,
-    wait_for_url_ready,
-    cleanup_modal_resources,
-    run_with_modal_retry,
-)
 
 if TYPE_CHECKING:
     from ..model import Model, TrainableModel
-    from .service import ModalServiceManager
-    import modal
 
 
 class ModalBackend(Backend):
     """
-    A Backend implementation that runs inference and training on Modal.
+    Modal backend for ART with basic functionality and proper Modal API usage.
 
-    Modal is a serverless cloud platform that can dynamically provision GPU resources
-    for ML workloads. This backend handles Modal app deployment and lifecycle management.
+    Provides the core functionality needed for ART training and inference
+    with Modal's serverless infrastructure.
     """
 
-    def __init__(
-        self,
-        *,
-        gpu_type: str = "H100",
-        gpu_count: int = 1,
-        memory_gb: int = 32,
-        timeout_seconds: int = 3600,
+    def __init__(self, base_url: str):
+        """Private constructor. Use initialize_cluster() class method instead."""
+        super().__init__(base_url=base_url)
+        self._modal_app = None
+        self._function_handle = None
+        self._deployment_url = base_url
+        self._app_name = None
+        self._env_vars = {}
+
+    @classmethod
+    async def initialize_cluster(
+        cls,
         app_name: str = "art-backend",
-        enable_file_sync: bool = True,
-        verbose: bool = False,
-    ) -> None:
+        gpu_type: str = "A10G",
+        gpu_count: int = 1,
+        memory: int = 32000,
+        timeout: int = 3600,
+        keep_warm: int = 0,
+        volume_name: str = "art-volume",
+        image_packages: list[str] | None = None,
+        environment: str = "main",
+        env_file: str | None = None,
+        force_rebuild: bool = False,
+    ) -> "ModalBackend":
         """
-        Initialize the Modal backend.
+        Initialize a Modal backend cluster.
 
         Args:
-            gpu_type: The type of GPU to request (e.g., "H100", "A100", "T4").
-            gpu_count: Number of GPUs to request.
-            memory_gb: Amount of memory in GB to request.
-            timeout_seconds: Timeout for Modal functions in seconds.
-            app_name: Name for the Modal app.
-            enable_file_sync: Enable file synchronization with persistent storage.
-            verbose: Enable verbose logging.
+            app_name: Name for the Modal app
+            gpu_type: GPU type (e.g., "A10G", "A100", "H100", "T4")
+            gpu_count: Number of GPUs
+            memory: Memory allocation in MB
+            timeout: Function timeout in seconds
+            keep_warm: Number of containers to keep warm
+            volume_name: Name for the Modal volume
+            image_packages: Additional packages to install
+            environment: Modal environment name
+            env_file: Path to environment file (.env)
+            force_rebuild: Force rebuild of existing app
+
+        Returns:
+            Initialized ModalBackend instance
         """
-        # Resource configuration
-        self._resource_config = ModalResourceConfig(
-            gpu_type=gpu_type,
-            gpu_count=gpu_count,
-            memory_gb=memory_gb,
-            timeout_seconds=timeout_seconds,
-        )
+        self = cls.__new__(cls)
+        self._app_name = app_name
+        self._env_vars = {}
 
-        # Deployment configuration
-        self._deployment_config = ModalDeploymentConfig(
-            app_name=app_name,
-            environment="production",
-        )
+        # Load environment variables from file if provided
+        if env_file and os.path.exists(env_file):
+            env_vars_from_file = dotenv_values(env_file)
+            self._env_vars.update({k: v for k, v in env_vars_from_file.items() if v})
 
-        # Modal app and function references
-        self._modal_app: Optional["modal.App"] = None
-        self._modal_url: Optional[str] = None
-        self._is_deployed = False
-        self._service_manager: Optional["ModalServiceManager"] = None
+        # Construct GPU configuration string
+        gpu_config = f"{gpu_type}:{gpu_count}"
 
-        # Configuration
-        self._enable_file_sync = enable_file_sync
-        self._verbose = verbose
-
-        # Initialize the base Backend with a placeholder URL
-        # This will be updated once the Modal app is deployed
-        super().__init__(base_url="http://localhost:7999")
-
-    async def __aenter__(self):
-        """
-        Async context manager entry. Deploys the Modal app and starts the backend.
-        """
-        await self._deploy_modal_app()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """
-        Async context manager exit. Cleans up Modal resources.
-        """
-        await self._cleanup_modal_app()
-
-    async def _deploy_modal_app(self) -> None:
-        """
-        Deploy the Modal app with the specified GPU and memory configuration.
-
-        This method creates and deploys a Modal app that runs the ART backend server,
-        then updates the base_url to point to the deployed Modal endpoint.
-        """
-        try:
-            # Import modal here to avoid requiring it unless this backend is used
-            import modal  # noqa: F401
-        except ImportError:
-            raise ModalError(
-                "Modal is required to use ModalBackend. Install it with: pip install modal"
-            )
+        # Prepare image packages
+        image_packages_final = image_packages or []
 
         try:
-            await run_with_modal_retry(self._create_and_deploy_app, max_retries=3)
-        except Exception as e:
-            raise ModalError(f"Failed to deploy Modal app: {e}")
+            # Check if app already exists
+            existing_function = None
+            try:
+                existing_function = modal.Function.lookup(
+                    app_name, "fastapi_app", environment_name=environment
+                )
+            except modal.exception.NotFoundError:
+                pass
 
-    async def _create_and_deploy_app(self) -> None:
-        """Create and deploy the Modal app."""
-        import modal
-        from .app import fastapi_app
-
-        if self._verbose:
-            print(f"Creating Modal app: {self._deployment_config.app_name}")
-
-        # Create Modal app
-        self._modal_app = modal.App(self._deployment_config.app_name)
-
-        # Create Modal image with ART dependencies
-        image = create_modal_image(self._deployment_config)
-        gpu_config = get_gpu_config(self._resource_config)
-
-        # Deploy the FastAPI app from app.py as a Modal function
-        @self._modal_app.function(
-            image=image,
-            gpu=gpu_config,
-            memory=self._resource_config.memory_gb * 1024,  # Convert GB to MB
-            timeout=self._resource_config.timeout_seconds,
-            allow_concurrent_inputs=self._resource_config.allow_concurrent_inputs,
-            keep_warm=self._resource_config.keep_warm,
-            container_idle_timeout=self._resource_config.container_idle_timeout,
-        )
-        @modal.asgi_app()
-        def art_web_app():
-            """Deploy the ART FastAPI application to Modal."""
-            return fastapi_app
-
-        if self._verbose:
-            print(
-                f"Deploying Modal app '{self._deployment_config.app_name}' with {self._resource_config.gpu_count}x{self._resource_config.gpu_type} GPU(s)..."
-            )
-
-        # Deploy the app using Modal's deployment mechanism
-        try:
-            with self._modal_app.run():
-                # Get the web URL for the deployed function
-                self._modal_url = art_web_app.web_url
-                self._is_deployed = True
-
-                # Update the base client URL to point to Modal
-                self._base_url = self._modal_url
-
-                if self._verbose:
-                    print(f"Modal app deployed successfully at: {self._modal_url}")
-
-                # Initialize service manager (lazy import)
-                from .service import ModalServiceManager
-
-                self._service_manager = ModalServiceManager(
-                    modal_workspace_path="/tmp/art_workspace",
-                    enable_file_sync=self._enable_file_sync,
-                    verbose=self._verbose,
+            if existing_function and not force_rebuild:
+                print(f"App {app_name} already exists, using existing deployment...")
+                base_url = existing_function.get_web_url()
+                self._function_handle = existing_function
+            else:
+                # Deploy new app
+                base_url = await self._deploy_new_app(
+                    app_name,
+                    gpu_config,
+                    memory,
+                    timeout,
+                    keep_warm,
+                    volume_name,
+                    image_packages_final,
+                    environment,
                 )
 
-                # Wait for the URL to be ready
-                if not await wait_for_url_ready(self._modal_url, timeout_seconds=60):
-                    raise ModalError("Modal app deployed but URL is not responding")
-
         except Exception as e:
-            self._is_deployed = False
-            self._modal_url = None
-            raise ModalError(f"Failed to deploy Modal app: {e}")
-
-    async def _cleanup_modal_app(self) -> None:
-        """
-        Clean up Modal app resources.
-        """
-        if self._modal_app and self._is_deployed:
-            if self._verbose:
-                print(f"Cleaning up Modal app '{self._deployment_config.app_name}'...")
-
-            try:
-                # Clean up service manager
-                if self._service_manager:
-                    await self._service_manager.cleanup_all_services()
-                    self._service_manager = None
-
-                # Clean up Modal resources
-                await cleanup_modal_resources(self._modal_app)
-
-                self._is_deployed = False
-                self._modal_url = None
-
-                if self._verbose:
-                    print("Modal app cleanup completed")
-            except Exception as e:
-                if self._verbose:
-                    print(f"Warning: Error during cleanup: {e}")
-
-    async def _ensure_deployed(self) -> None:
-        """
-        Ensure the Modal app is deployed before making requests.
-        """
-        if not self._is_deployed:
-            raise RuntimeError(
-                "Modal app not deployed. Use 'async with ModalBackend() as backend:' "
-                "or call await backend._deploy_modal_app() first."
+            print(f"Error with existing app, deploying new app: {e}")
+            base_url = await self._deploy_new_app(
+                app_name,
+                gpu_config,
+                memory,
+                timeout,
+                keep_warm,
+                volume_name,
+                image_packages_final,
+                environment,
             )
 
-    # Backend interface implementation
+        if not base_url:
+            raise RuntimeError("Failed to get valid base URL from Modal deployment")
+
+        print(f"Using base_url: {base_url}")
+
+        # Initialize the backend with the URL
+        super(cls, self).__init__(base_url=base_url)
+        self._deployment_url = base_url
+
+        # Wait for the app to be ready
+        await self._wait_for_app_ready(base_url)
+
+        return self
+
+    async def _deploy_new_app(
+        self,
+        app_name: str,
+        gpu_config: str,
+        memory: int,
+        timeout: int,
+        keep_warm: int,
+        volume_name: str,
+        image_packages: list[str],
+        environment: str,
+    ) -> str:
+        """Deploy a new Modal app and return its URL."""
+        try:
+            # Create the Modal app
+            self._modal_app = create_modal_app(
+                app_name=app_name,
+                volume_name=volume_name,
+                gpu_config=gpu_config,
+                timeout=timeout,
+                memory=memory,
+                keep_warm=keep_warm,
+                env_vars=self._env_vars,
+                image_packages=image_packages,
+            )
+
+            # Deploy the app
+            print("Deploying Modal app...")
+            await asyncio.to_thread(
+                lambda: self._modal_app.deploy(environment=environment)
+            )
+
+            # Get the function handle and URL
+            self._function_handle = modal.Function.lookup(
+                app_name, "fastapi_app", environment_name=environment
+            )
+
+            base_url = self._function_handle.get_web_url()
+            print(f"App deployed successfully at: {base_url}")
+
+            return base_url
+
+        except Exception as e:
+            print(f"Error deploying Modal app: {e}")
+            raise RuntimeError(f"Failed to deploy Modal app: {e}")
+
+    async def _wait_for_app_ready(
+        self, base_url: str, max_retries: int = 30, delay: float = 10
+    ) -> None:
+        """Wait for the Modal app to be ready and responsive."""
+        print("Waiting for app to be ready...")
+
+        async with httpx.AsyncClient() as client:
+            for attempt in range(max_retries):
+                try:
+                    response = await client.get(f"{base_url}/health", timeout=5)
+                    if response.status_code == 200:
+                        print("App is ready!")
+                        return
+                except (httpx.RequestError, httpx.TimeoutException):
+                    pass
+
+                if attempt < max_retries - 1:
+                    print(
+                        f"App not ready yet (attempt {attempt + 1}/{max_retries}), retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    # Try basic connectivity on final attempt
+                    try:
+                        response = await client.get(base_url, timeout=10)
+                        if response.status_code in [
+                            200,
+                            404,
+                            422,
+                        ]:  # 404/422 are OK for FastAPI
+                            print("App appears to be responding (no health endpoint)")
+                            return
+                    except Exception:
+                        pass
+
+                    print("Warning: App may not be fully ready, but proceeding...")
 
     async def register(self, model: "Model") -> None:
-        """
-        Register a model with the Modal backend.
-
-        Args:
-            model: The model to register.
-        """
-        await self._ensure_deployed()
+        """Register a model with the backend."""
+        print("Registering model with Modal backend")
+        print(f"App URL: {self._deployment_url}")
         await super().register(model)
-
-    async def close(self) -> None:
-        """
-        Close the Modal backend and clean up resources.
-        """
-        await self._cleanup_modal_app()
-        await super().close()
-
-    async def _get_step(self, model: "TrainableModel") -> int:
-        """Get the current training step for a model."""
-        await self._ensure_deployed()
-        return await super()._get_step(model)
-
-    async def _delete_checkpoints(
-        self,
-        model: "TrainableModel",
-        benchmark: str,
-        benchmark_smoothing: float,
-    ) -> None:
-        """Delete model checkpoints based on benchmark criteria."""
-        await self._ensure_deployed()
-        await super()._delete_checkpoints(model, benchmark, benchmark_smoothing)
 
     async def _prepare_backend_for_training(
         self,
         model: "TrainableModel",
-        config: dev.OpenAIServerConfig | None,
+        config: Any,
     ) -> tuple[str, str]:
-        """Prepare the backend for training and return connection details."""
-        await self._ensure_deployed()
-        return await super()._prepare_backend_for_training(model, config)
-
-    async def _log(
-        self,
-        model: "Model",
-        trajectory_groups: list[TrajectoryGroup],
-        split: str = "val",
-    ) -> None:
-        """Log trajectory groups for a model."""
-        await self._ensure_deployed()
-        await super()._log(model, trajectory_groups, split)
-
-    async def _train_model(
-        self,
-        model: "TrainableModel",
-        trajectory_groups: list[TrajectoryGroup],
-        config: TrainConfig,
-        dev_config: dev.TrainConfig,
-        verbose: bool = False,
-    ) -> AsyncIterator[dict[str, float]]:
-        """Train a model with streaming progress updates."""
-        await self._ensure_deployed()
-
-        if self._verbose or verbose:
-            print(f"Starting training for model {model.name} on Modal")
-
-        # Stream results from the parent implementation (which makes HTTP calls to Modal)
-        async for result in super()._train_model(
-            model, trajectory_groups, config, dev_config, verbose
-        ):
-            yield result
-
-        if self._verbose or verbose:
-            print(f"Training completed for model {model.name}")
-
-    # Experimental S3 support methods
-
-    async def _experimental_pull_from_s3(
-        self,
-        model: "Model",
-        *,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        delete: bool = False,
-        only_step: int | Literal["latest"] | None = None,
-    ) -> None:
-        """Download the model directory from S3 into file system where the Modal backend is running."""
-        await self._ensure_deployed()
-        await super()._experimental_pull_from_s3(
-            model=model,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-            delete=delete,
-            only_step=only_step,
+        """Prepare backend for training and return base URL and API key."""
+        response = await self._client.post(
+            "/_prepare_backend_for_training",
+            json={"model": model.model_dump(), "config": config},
+            timeout=1200,
         )
+        response.raise_for_status()
+        result = response.json()
 
-    async def _experimental_push_to_s3(
-        self,
-        model: "Model",
-        *,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        delete: bool = False,
-    ) -> None:
-        """Upload the model directory from the file system where the Modal backend is running to S3."""
-        await self._ensure_deployed()
-        await super()._experimental_push_to_s3(
-            model=model,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-            delete=delete,
-        )
+        # Return the same base URL since Modal serves everything from one endpoint
+        return self._deployment_url, result[1] if isinstance(
+            result, list
+        ) else result.get("api_key", "")
 
-    async def _experimental_fork_checkpoint(
-        self,
-        model: "Model",
-        from_model: str,
-        from_project: str | None = None,
-        from_s3_bucket: str | None = None,
-        not_after_step: int | None = None,
-        verbose: bool = False,
-        prefix: str | None = None,
-    ) -> None:
-        """Fork a checkpoint from another model to initialize this model."""
-        await self._ensure_deployed()
-        await super()._experimental_fork_checkpoint(
-            model=model,
-            from_model=from_model,
-            from_project=from_project,
-            from_s3_bucket=from_s3_bucket,
-            not_after_step=not_after_step,
-            verbose=verbose,
-            prefix=prefix,
-        )
+    async def down(self) -> None:
+        """Shutdown the Modal app deployment."""
+        if self._function_handle:
+            try:
+                print(f"Modal app '{self._app_name}' is deployed.")
+                print("Note: Modal functions cannot be stopped programmatically.")
+                print(f"To stop the app, run: modal app stop {self._app_name}")
+                # Reset internal state
+                self._function_handle = None
+                self._modal_app = None
+                print("Backend state cleared")
+            except Exception as e:
+                print(f"Error clearing backend state: {e}")
+                raise
+        else:
+            print("No active Modal function to stop")
 
-    async def _experimental_deploy(
-        self,
-        deploy_to: LoRADeploymentProvider,
-        model: "Model",
-        step: int | None = None,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        pull_s3: bool = True,
-        wait_for_completion: bool = True,
-    ) -> LoRADeploymentJob:
-        """Deploy the model's latest checkpoint to a hosted inference endpoint."""
-        await self._ensure_deployed()
-        return await super()._experimental_deploy(
-            deploy_to=deploy_to,
-            model=model,
-            step=step,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-            pull_s3=pull_s3,
-            wait_for_completion=wait_for_completion,
-        )
+    async def get_status(self) -> Dict[str, Any]:
+        """Get the current status of the Modal deployment."""
+        if self._function_handle is None:
+            return {"status": "not_deployed", "app_name": self._app_name}
 
-    # Property accessors
+        try:
+            # Try to get basic info about the function
+            stats = await asyncio.to_thread(
+                lambda: self._function_handle.get_current_stats()
+            )
+
+            return {
+                "status": "deployed",
+                "app_name": self._app_name,
+                "url": self._deployment_url,
+                "stats": stats,
+            }
+        except Exception as e:
+            return {"status": "error", "app_name": self._app_name, "error": str(e)}
+
+    async def is_healthy(self) -> bool:
+        """Check if the Modal backend is healthy and responsive."""
+        if not self._deployment_url:
+            return False
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{self._deployment_url}/health", timeout=5)
+                return response.status_code == 200
+        except Exception:
+            return False
 
     @property
-    def modal_url(self) -> Optional[str]:
-        """Get the deployed Modal app URL."""
-        return self._modal_url
+    def app_name(self) -> str:
+        """Get the app name."""
+        return self._app_name
 
     @property
-    def is_deployed(self) -> bool:
-        """Check if the Modal app is currently deployed."""
-        return self._is_deployed
+    def deployment_url(self) -> str | None:
+        """Get the deployment URL."""
+        return self._deployment_url
 
     @property
-    def gpu_config(self) -> dict:
-        """Get the current GPU configuration."""
-        return {
-            "gpu_type": self._resource_config.gpu_type,
-            "gpu_count": self._resource_config.gpu_count,
-            "memory_gb": self._resource_config.memory_gb,
-            "timeout_seconds": self._resource_config.timeout_seconds,
-        }
-
-    @property
-    def deployment_config(self) -> ModalDeploymentConfig:
-        """Get the deployment configuration."""
-        return self._deployment_config
-
-    @property
-    def resource_config(self) -> ModalResourceConfig:
-        """Get the resource configuration."""
-        return self._resource_config
-
-    @property
-    def service_manager(self) -> Optional["ModalServiceManager"]:
-        """Get the service manager instance."""
-        return self._service_manager
+    def env_vars(self) -> Dict[str, str]:
+        """Get the environment variables."""
+        return self._env_vars.copy()
